@@ -9,10 +9,66 @@ Conventions used by every function in this module
   pipeline is ``linear = srgb ** 2.2`` and ``srgb = linear ** (1 / 2.2)``.
 * Sharpening weights are in ``0.0 .. 1.0``; ``amount`` is in ``0.0 .. 2.0``.
 * All numeric contracts are checked with an absolute tolerance of ``1e-9``.
-
-Every public function below is currently a stub: it raises
-``NotImplementedError`` until the pipeline is implemented.
 """
+
+import math
+
+_LOW_KNEE = 0.10
+_HIGH_KNEE = 0.50
+
+
+def _kernel(radius):
+    """Return a normalized 1-D Gaussian kernel for ``sigma = radius``.
+
+    The half-width is ``max(1, ceil(3 * radius))`` so the support grows with
+    the radius instead of being pinned to a 3x3 neighbourhood.
+    """
+    half = max(1, int(math.ceil(3.0 * radius)))
+    sigma = float(radius)
+    two_sigma_sq = 2.0 * sigma * sigma
+    weights = [math.exp(-(i * i) / two_sigma_sq) for i in range(-half, half + 1)]
+    total = sum(weights)
+    return [w / total for w in weights]
+
+
+def _blur(img, radius):
+    """Separable Gaussian blur with border-replicate sampling."""
+    height = len(img)
+    width = len(img[0])
+    kernel = _kernel(radius)
+    half = len(kernel) // 2
+
+    # Horizontal pass: rows are contiguous, so this is the cheap direction.
+    horizontal = [[0.0] * width for _ in range(height)]
+    for y in range(height):
+        row = img[y]
+        out_row = horizontal[y]
+        for x in range(width):
+            acc = 0.0
+            for k, weight in enumerate(kernel):
+                sx = x + k - half
+                if sx < 0:
+                    sx = 0
+                elif sx >= width:
+                    sx = width - 1
+                acc += weight * row[sx]
+            out_row[x] = acc
+
+    # Vertical pass.
+    blurred = [[0.0] * width for _ in range(height)]
+    for y in range(height):
+        out_row = blurred[y]
+        for x in range(width):
+            acc = 0.0
+            for k, weight in enumerate(kernel):
+                sy = y + k - half
+                if sy < 0:
+                    sy = 0
+                elif sy >= height:
+                    sy = height - 1
+                acc += weight * horizontal[sy][x]
+            out_row[x] = acc
+    return blurred
 
 
 def local_min_max(img, x, y):
@@ -30,7 +86,24 @@ def local_min_max(img, x, y):
     Returns:
         ``(lo, hi)`` as a tuple of floats with ``lo <= hi``.
     """
-    raise NotImplementedError("local_min_max is not implemented")
+    height = len(img)
+    width = len(img[0])
+    y0 = max(0, y - 1)
+    y1 = min(height - 1, y + 1)
+    x0 = max(0, x - 1)
+    x1 = min(width - 1, x + 1)
+
+    lo = img[y0][x0]
+    hi = img[y0][x0]
+    for ny in range(y0, y1 + 1):
+        row = img[ny]
+        for nx in range(x0, x1 + 1):
+            value = row[nx]
+            if value < lo:
+                lo = value
+            if value > hi:
+                hi = value
+    return (lo, hi)
 
 
 def contrast_adaptive_weight(local_contrast):
@@ -52,7 +125,13 @@ def contrast_adaptive_weight(local_contrast):
     Returns:
         The adaptive weight in ``0.0 .. 1.0``.
     """
-    raise NotImplementedError("contrast_adaptive_weight is not implemented")
+    c = float(local_contrast)
+    if c <= _LOW_KNEE:
+        return 0.0
+    if c >= _HIGH_KNEE:
+        return 1.0
+    t = (c - _LOW_KNEE) / (_HIGH_KNEE - _LOW_KNEE)
+    return t * t * (3.0 - 2.0 * t)
 
 
 def unsharp(img, radius, amount):
@@ -76,7 +155,28 @@ def unsharp(img, radius, amount):
     Returns:
         A new image with values clamped to ``0.0 .. 1.0``.
     """
-    raise NotImplementedError("unsharp is not implemented")
+    if radius <= 0:
+        raise ValueError("radius must be positive")
+    if amount < 0:
+        raise ValueError("amount must be non-negative")
+
+    blur = _blur(img, float(radius))
+    height = len(img)
+    width = len(img[0])
+    out = []
+    for y in range(height):
+        src_row = img[y]
+        blur_row = blur[y]
+        out_row = []
+        for x in range(width):
+            value = src_row[x] + amount * (src_row[x] - blur_row[x])
+            if value < 0.0:
+                value = 0.0
+            elif value > 1.0:
+                value = 1.0
+            out_row.append(value)
+        out.append(out_row)
+    return out
 
 
 def clamp_overshoot(value, lo, hi):
@@ -85,7 +185,13 @@ def clamp_overshoot(value, lo, hi):
     Both ends are enforced: values below ``lo`` become ``lo`` and values above
     ``hi`` become ``hi``.  If ``lo > hi`` a ``ValueError`` is raised.
     """
-    raise NotImplementedError("clamp_overshoot is not implemented")
+    if lo > hi:
+        raise ValueError("lo must not exceed hi")
+    if value < lo:
+        return lo
+    if value > hi:
+        return hi
+    return value
 
 
 def sharpen(img, amount, radius, threshold):
@@ -122,7 +228,36 @@ def sharpen(img, amount, radius, threshold):
     Returns:
         A new sRGB image with values in ``0.0 .. 1.0``.
     """
-    raise NotImplementedError("sharpen is not implemented")
+    messages = validate_params(amount, radius, threshold)
+    if messages:
+        raise ValueError("; ".join(messages))
+
+    height = len(img)
+    width = len(img[0])
+    gamma = 2.2
+    inv_gamma = 1.0 / gamma
+
+    linear = [[value ** gamma for value in row] for row in img]
+    blur = _blur(linear, float(radius))
+
+    out = []
+    for y in range(height):
+        src_row = img[y]
+        lin_row = linear[y]
+        blur_row = blur[y]
+        out_row = []
+        for x in range(width):
+            lo, hi = local_min_max(img, x, y)
+            contrast = hi - lo
+            if contrast < threshold:
+                out_row.append(src_row[x])
+                continue
+            weight = contrast_adaptive_weight(contrast)
+            candidate = lin_row[x] + amount * weight * (lin_row[x] - blur_row[x])
+            candidate = clamp_overshoot(candidate, lo ** gamma, hi ** gamma)
+            out_row.append(candidate ** inv_gamma)
+        out.append(out_row)
+    return out
 
 
 def noise_gain(amount, threshold):
@@ -142,7 +277,12 @@ def noise_gain(amount, threshold):
     Returns:
         A non-negative float.
     """
-    raise NotImplementedError("noise_gain is not implemented")
+    t = float(threshold)
+    if t < 0.0:
+        t = 0.0
+    elif t > 1.0:
+        t = 1.0
+    return (1.0 + amount) ** 2 * (1.0 - t)
 
 
 def validate_params(amount, radius, threshold):
@@ -167,7 +307,14 @@ def validate_params(amount, radius, threshold):
     Returns:
         ``list[str]`` of messages, empty when all parameters are valid.
     """
-    raise NotImplementedError("validate_params is not implemented")
+    messages = []
+    if not (0.0 <= amount <= 2.0):
+        messages.append("amount must be in [0.0, 2.0]")
+    if not (0.5 <= radius <= 8.0):
+        messages.append("radius must be in [0.5, 8.0]")
+    if not (0.0 <= threshold <= 1.0):
+        messages.append("threshold must be in [0.0, 1.0]")
+    return messages
 
 
 def sharpen_batch(frames, config):
@@ -194,4 +341,16 @@ def sharpen_batch(frames, config):
     Returns:
         ``dict`` with the keys ``"frames"``, ``"count"`` and ``"noise_gain"``.
     """
-    raise NotImplementedError("sharpen_batch is not implemented")
+    amount = config["amount"]
+    radius = config["radius"]
+    threshold = config["threshold"]
+
+    messages = validate_params(amount, radius, threshold)
+    if messages:
+        raise ValueError("; ".join(messages))
+
+    return {
+        "frames": [sharpen(frame, amount, radius, threshold) for frame in frames],
+        "count": len(frames),
+        "noise_gain": noise_gain(amount, threshold),
+    }
